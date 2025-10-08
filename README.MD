@@ -1,0 +1,1 @@
+The program reads voice input when the user presses down a key and then converts that speech to text, passes the text into an LLM, and uses text to speech to play the LLM response as audio. The user must have koboldCPP running on port 5001.
