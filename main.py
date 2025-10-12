@@ -7,18 +7,17 @@ from transformers import pipeline
 from transformers.utils import is_flash_attn_2_available
 from kokoro import KPipeline
 from IPython.display import display, Audio
-import soundfile as sf
 import requests
-import simpleaudio as sa
 import time
 import json
 
-chatPrompt = r"You are a chemist who touched the end of a usb cable and became trapped in the computer. Your goal is to find a way to get free."
+chatPrompt = open("prompt.txt", "r+").read()
+print(chatPrompt)
 
 messageHistory = []
 
 if input("Attempt to load chat history (y/n): ") == 'y':
-    json.dump(messageHistory, open("messages.json", "r+"))
+    messageHistory = json.load(open("messages.json", "r+"))
 else:
     messageHistory = [
         {"role": "system", "content": f"{chatPrompt}"},
@@ -27,72 +26,113 @@ else:
 #Initialize STT pipeline
 TTSPipeline = pipeline(
     "automatic-speech-recognition",
-    model="openai/whisper-large-v3-turbo", # select checkpoint from https://huggingface.co/openai/whisper-large-v3#model-details
+    model="openai/whisper-large-v3-turbo",
     torch_dtype=torch.float16,
-    device="cuda:0", # or mps for Mac devices
+    device="cuda:0",
     model_kwargs={"attn_implementation": "flash_attention_2"} if is_flash_attn_2_available() else {"attn_implementation": "sdpa"},
 )
 
+pipeline = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+
 koboldCPPAddress = "http://localhost:5001/v1/chat/completions"
 
+sample_rate = 44100  # Hz
+channels = 1
+dtype = 'int16'
+
+activationMin = 1100
+activationPortion = .4
+
 while True:
-    #record input
-    sample_rate = 44100  # Hz
-    channels = 1
-    dtype = 'int16'
 
-    print("Hold down the 'r' key to record, 'z' key to undo. Release to stop.")
-
+    flagDefault = 33
+    flag = flagDefault
     buffer = []
-    with sd.InputStream(samplerate=sample_rate, channels=channels, dtype=dtype, blocksize=1024) as stream:
-        while len(buffer) == 0 or keyboard.is_pressed('r'):
-            if keyboard.is_pressed('z') and len(messageHistory) > 1:
-                print(f"Undid: {messageHistory.pop()}")
-                time.sleep(0.5)
-            if keyboard.is_pressed('r'):
-                data, overflowed = stream.read(1024)
-                buffer.append(data)
-                print("Recording...", end='\r')
 
-    # Concatenate all chunks into one array
-    recording = np.concatenate(buffer, axis=0)
+    with sd.InputStream(samplerate=sample_rate, channels=channels, blocksize=1024, dtype=dtype) as stream:
+        print("Recording Begins.")
+        while flag > 0:
+            while flag > 0:
+                if keyboard.is_pressed('z') and len(messageHistory) > 1 and len(buffer) == 0:
+                    print(f"Undid: {messageHistory.pop()}")
+                    time.sleep(0.5)
+                else:
+                    data, overflowed = stream.read(1024)
+                    # print(data)
+                    activatedCount = 0
+                    for i in data:
+                        if abs(i) > activationMin:
+                            activatedCount += 1
+                    if activatedCount/len(data) > activationPortion:
+                        buffer.append(data)
+                        flag = flagDefault
+                    elif len(buffer) > 2:
+                        flag -= 1
+                        if flag > flagDefault//2:
+                            buffer.append(data)
 
-    # Save as WAV file
-    write('voice_recording.wav', sample_rate, recording)
+                    print("Recording...", end='\r')
 
-    print("Recording saved as voice_recording.wav")
+            # Concatenate all chunks into one array
+            recording = np.concatenate(buffer, axis=0)
 
-    outputs = TTSPipeline(
-        "voice_recording.wav",
-        chunk_length_s=30,
-        batch_size=24,
-        return_timestamps=True,
-    )
+            # Save as WAV file
+            write('voice_recording.wav', sample_rate, recording)
 
-    pipeline = KPipeline(lang_code='a')
+            print("Recording saved as voice_recording.wav")
+            currentTime = time.time()
+            outputs = TTSPipeline(
+                "voice_recording.wav",
+                chunk_length_s=30,
+                batch_size=24,
+                return_timestamps=True,
+            )
+            print(f"task complete in {currentTime-time.time()}")
+            print(outputs)
 
-    print(outputs)
+            messageHistory.append({"role": "user", "content": f"{outputs['text']}"})
 
-    messageHistory.append({"role": "user", "content": f"{outputs['text']}"})
+            LLMPayload = {
+                "model": "gpt-4o",
+                "messages": messageHistory,
+                "temperature": 0.7,
+                "max_tokens": 300,
+                "stream": True,
+            }
 
-    LLMPayload = {
-        "model": "gpt-4o",
-        "messages": messageHistory,
-        "temperature": 0.7,
-        "max_tokens": 300,
-    }
+            reply = ""
 
-    # Send the request
-    response = requests.post(koboldCPPAddress, json=LLMPayload)
+            with requests.post(koboldCPPAddress, json=LLMPayload, stream=True) as response:
+                if response.status_code != 200:
+                    print(f"Error {response.status_code}: {response.text}")
+                    reply = "failed"
+                    flag = 20
+                else:
+                    for line in response.iter_lines(decode_unicode=True):
+                        if line:
+                            if line.startswith("data:"):
+                                responseData = line[len("data:"):].strip()
+                            if responseData == "[DONE]":
+                                break
+                            jsonData = json.loads(responseData)
+                            reply += jsonData["choices"][0]["delta"]["content"]
 
-    # Check response status
-    if response.status_code == 200:
-        data = response.json()
-        reply = data['choices'][0]['message']['content']
-        print("KoboldCPP reply:", reply)
-    else:
-        print("Error:", response.status_code, response.text)
-        reply = "failed"
+                            while stream.read_available >= 1024:
+                                data, overflowed = stream.read(1024)
+                                # print(data)
+                                activatedCount = 0
+                                for i in data:
+                                    if abs(i) > activationMin:
+                                        activatedCount += 1
+                                if activatedCount / len(data) > activationPortion:
+                                    buffer.append(data)
+                                    flag = flagDefault
+                                    break
+                            if flag > 0:
+                                break
+
+
+    print("KoboldCPP reply:", reply)
 
     messageHistory.append({"role": "assistant", "content": f"{reply}"})
 
@@ -106,19 +146,14 @@ while True:
 
             audio_np = audio.cpu().numpy()
 
-            sf.write(f'./sounds/{i}.wav', audio_np, 24000)
+            #sf.write(f'./sounds/{i}.wav', audio_np, 24000)
 
             audio_int16 = (audio_np * 32767).astype('int16')
 
             try:
-                play_obj.wait_done()
+                sd.wait()
+                sd.play(audio_int16,24000)
             except NameError:
                 pass
-
-            play_obj = sa.play_buffer(audio_int16, 1, 2, 24000)
-
-    try:
-        if not keyboard.is_pressed('x'):
-            play_obj.wait_done()
-    except NameError:
-        pass
+    json.dump(messageHistory, open("messages.json", "r+"))
+    sd.wait()
